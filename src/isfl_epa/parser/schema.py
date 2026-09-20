@@ -38,6 +38,7 @@ class ParsedPlay(BaseModel):
     play_type: PlayType
     description: str  # raw m field
     css: str = ""
+    counts_as_play: bool = True
     # Outcomes
     yards_gained: int | None = None
     first_down: bool = False

@@ -29,6 +29,7 @@ from isfl_epa.epa.features import (
 )
 from isfl_epa.epa.model import EPModel, EPModelPair
 
+EPA_PLAY_TYPES = {"pass", "rush", "sack"}
 
 def compute_epa_for_season(
     season: int,
@@ -97,6 +98,13 @@ def compute_epa_for_df(
 
         for pi in range(len(game_pos)):
             pos = game_pos[pi]
+
+            # Only assign EPA to offensive scrimmage plays we want to analyze.
+            # Field goals, punts, kickoffs, etc. can still serve as game states
+            # but do not receive EPA themselves.
+            if pt_arr[pos] not in EPA_PLAY_TYPES:
+                continue
+
             if np.isnan(ep_before_arr[pos]):
                 continue
 
@@ -148,7 +156,7 @@ def _compute_ep_after_arr(
         if is_defensive_td:
             return -(6 + pat_bonus)
         return 6 + pat_bonus
-    if play_types[pos] == "field_goal" and fg_good[pos] is True:
+    if play_types[pos] == "field_goal" and _is_truthy(fg_good[pos]):
         return 3.0
     if _is_truthy(safeties[pos]):
         return -2.0
@@ -210,6 +218,9 @@ def _ep_after_drive_arr(
         if play_types[npos] == "kickoff":
             return 0.0
 
+        if play_types[npos] == "punt":
+            return 0.0
+
         poss_next = poss_tid[npos]
 
         # Possession changed → drive ended without scoring
@@ -234,7 +245,7 @@ def _ep_after_drive_arr(
                 return -(6 + pat_bonus)
             return 6 + pat_bonus
 
-        if play_types[npos] == "field_goal" and fg_good[npos] is True:
+        if play_types[npos] == "field_goal" and _is_truthy(fg_good[npos]):
             return 3.0
 
         if _is_truthy(safeties[npos]):
@@ -248,31 +259,107 @@ def _ep_after_halfscore_arr(
     ep_before: np.ndarray,
     halves: np.ndarray,
     poss_tid: np.ndarray,
+    touchdowns: np.ndarray,
+    interceptions: np.ndarray,
+    fumbles_lost: np.ndarray,
+    pat_good: np.ndarray,
+    play_types: np.ndarray,
+    fg_good: np.ndarray,
+    safeties: np.ndarray,
     game_pos: np.ndarray,
     pi: int,
     current_half,
     poss_current,
 ) -> float:
-    """EP_after for next-score-in-half model using numpy arrays."""
-    # Find next play with valid ep_before
+    """EP_after for next-score-in-half model using numpy arrays.
+
+    Looks at every subsequent play, not just plays with an EP prediction,
+    so punts, kickoffs, and defensive scoring plays correctly terminate
+    the current possession/drive.
+    """
+
     for i in range(pi + 1, len(game_pos)):
         npos = game_pos[i]
-        if not np.isnan(ep_before[npos]):
-            # Found next valid play
-            if halves[npos] != current_half:
-                return 0.0
 
-            next_ep = ep_before[npos]
-            poss_next = poss_tid[npos]
+        # ---------------------------------------------------------------
+        # Half changed → possession/drive cannot continue
+        # ---------------------------------------------------------------
+        if halves[npos] != current_half:
+            return 0.0
 
-            if poss_current is not None and poss_next is not None:
-                try:
-                    if not pd.isna(poss_current) and not pd.isna(poss_next) and poss_current != poss_next:
+        # ---------------------------------------------------------------
+        # Scoring play → assign the scoring value immediately
+        # ---------------------------------------------------------------
+        if _is_truthy(touchdowns[npos]):
+            pat_bonus = 1 if _is_truthy(pat_good[npos]) else 0
+            is_def_td = (
+                _is_truthy(interceptions[npos])
+                or _is_truthy(fumbles_lost[npos])
+            )
+
+            if is_def_td:
+                return -(6 + pat_bonus)
+
+            return 6 + pat_bonus
+
+        # Field goal
+        if play_types[npos] == "field_goal" and _is_truthy(fg_good[npos]):
+            return 3.0
+
+        # Safety
+        if _is_truthy(safeties[npos]):
+            return -2.0
+
+        # ---------------------------------------------------------------
+        # Kickoff → current drive has ended without another score
+        # ---------------------------------------------------------------
+        if play_types[npos] == "kickoff":
+            return 0.0
+
+        # ---------------------------------------------------------------
+        # Punt → current drive has ended.
+        #
+        # If the punt itself produced a TD, the scoring-play logic above
+        # has already handled it.
+        # ---------------------------------------------------------------
+        if play_types[npos] == "punt":
+            return 0.0
+
+        # ---------------------------------------------------------------
+        # If possession changed on a non-punt play, flip the EP sign.
+        # ---------------------------------------------------------------
+        poss_next = poss_tid[npos]
+
+        if poss_current is not None and poss_next is not None:
+            try:
+                if (
+                    not pd.isna(poss_current)
+                    and not pd.isna(poss_next)
+                    and poss_current != poss_next
+                ):
+                    next_ep = ep_before[npos]
+
+                    if not np.isnan(next_ep):
                         return -next_ep
-                except (TypeError, ValueError):
-                    if poss_current != poss_next:
+
+                    return 0.0
+
+            except (TypeError, ValueError):
+                if poss_current != poss_next:
+                    next_ep = ep_before[npos]
+
+                    if not np.isnan(next_ep):
                         return -next_ep
 
+                    return 0.0
+
+        # ---------------------------------------------------------------
+        # Same possession and valid EP → this is the next state
+        # ---------------------------------------------------------------
+        next_ep = ep_before[npos]
+
+        if not np.isnan(next_ep):
             return next_ep
 
+    # End of game
     return 0.0

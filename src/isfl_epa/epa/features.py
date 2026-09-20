@@ -101,9 +101,19 @@ def valid_play_mask(df: pd.DataFrame, label_col: str | None = None) -> pd.Series
     Filters to plays that:
     - Are scrimmage types (pass, rush, sack, field_goal)
     - Have valid down, distance, yard_line, and score columns
-    - Are not 2-point conversions
+    - Exclude standalone 2-point conversion attempts
+    - Preserve touchdown plays whose description also mentions a 2-point conversion
     - Have a non-null label if *label_col* is specified
     """
+
+    is_two_point_conversion = df["description"].str.contains(
+        "2 point conversion",
+        case=False,
+        na=False,
+    )
+
+    is_touchdown = df["touchdown"].fillna(False).astype(bool)
+
     mask = (
         df["play_type"].isin(SCRIMMAGE_TYPES)
         & df["down"].notna()
@@ -111,10 +121,13 @@ def valid_play_mask(df: pd.DataFrame, label_col: str | None = None) -> pd.Series
         & df["yard_line"].notna()
         & df["score_away"].notna()
         & df["score_home"].notna()
-        & ~df["description"].str.contains("2 point|conversion", case=False, na=False)
+        & ~(is_two_point_conversion & ~is_touchdown)
+        & df["counts_as_play"].fillna(True)
     )
+
     if label_col is not None:
         mask = mask & df[label_col].notna()
+
     return mask
 
 

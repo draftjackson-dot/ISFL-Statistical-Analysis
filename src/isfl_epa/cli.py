@@ -197,7 +197,6 @@ def build(
     console.print(f"  Registered {registry.player_count} players")
 
     # Load into PostgreSQL
-    load_registry(engine, registry)
     load_season(engine, games, registry)
     console.print("  Loaded into PostgreSQL")
 
@@ -463,8 +462,8 @@ def train_ep(
             "save_path": MODEL_2016_PATH,
         }
     if era in ("2022", "both"):
-        test_2022 = list(range(27, 60, TEST_SEASON_2022_STEP))
-        train_2022 = [s for s in range(27, 60) if s not in test_2022]
+        train_2022 = list(range(27, 62))
+        test_2022 = [62]
         eras["2022"] = {
             "train_seasons": train_2022,
             "test_seasons": test_2022,

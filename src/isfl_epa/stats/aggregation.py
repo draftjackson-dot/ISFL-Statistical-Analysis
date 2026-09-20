@@ -63,6 +63,8 @@ def game_player_passing(game: Game, registry=None) -> list[PlayerPassing]:
     })
 
     for p in game.plays:
+        if not p.counts_as_play:
+            continue
         if _is_two_point(p):
             continue
 
@@ -100,6 +102,8 @@ def game_player_rushing(game: Game, registry=None) -> list[PlayerRushing]:
     })
 
     for p in game.plays:
+        if not p.counts_as_play:
+            continue
         if _is_two_point(p):
             continue
         if p.play_type == PlayType.RUSH and p.rusher:
@@ -129,6 +133,8 @@ def game_player_receiving(game: Game, registry=None) -> list[PlayerReceiving]:
     })
 
     for p in game.plays:
+        if not p.counts_as_play:
+            continue
         if _is_two_point(p):
             continue
         if p.play_type == PlayType.PASS and p.receiver and ", complete to" in p.description:
@@ -178,6 +184,8 @@ def game_player_defensive(game: Game, registry=None) -> list[PlayerDefensive]:
         return None
 
     for p in game.plays:
+        if not p.counts_as_play:
+            continue
         if p.tackler:
             stats[p.tackler]["tackles"] += 1
             if p.tackler not in defender_team:
@@ -245,9 +253,11 @@ def game_team_stats(game: Game) -> list[TeamGame]:
         }
 
     for p in game.plays:
-        if _is_two_point(p):
+        if not p.counts_as_play:
             continue
-
+        if _is_two_point(p):
+            continue    
+    
         team = _team_abbr(game, p.possession_team_id)
         if team not in t:
             continue
@@ -302,6 +312,8 @@ def game_team_stats(game: Game) -> list[TeamGame]:
     # Kneel adjustments
     if game.season >= _KNEELS_COUNT_AS_RUSHES_FROM:
         for p in game.plays:
+            if not p.counts_as_play:
+                continue
             if p.play_type == PlayType.KNEEL:
                 team = _team_abbr(game, p.possession_team_id)
                 if team in t:

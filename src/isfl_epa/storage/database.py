@@ -93,6 +93,7 @@ plays_table = Table(
     Column("play_type", String(20)),
     Column("description", Text),
     Column("css", String(5)),
+    Column("counts_as_play", Boolean, nullable=False, default=True, server_default="true"),
     # Situation
     Column("down", Integer),
     Column("distance", Integer),
@@ -147,6 +148,7 @@ plays_table = Table(
     # Pre-computed columns for viz queries
     Column("yardline_100", Integer),
     Column("half_seconds", Integer),
+    Column("game_seconds", Integer),
     # Indexes
     Index("ix_plays_game_id", "game_id"),
     Index("ix_plays_season", "season"),
@@ -512,38 +514,129 @@ def seed_registry_from_roster(
     return count
 
 
-def load_registry(engine: Engine, registry: PlayerRegistry) -> None:
-    """Write the in-memory player registry to PostgreSQL (upsert-safe)."""
-    with engine.begin() as conn:
-        for p in registry.all_players():
-            conn.execute(
-                pg_insert(players_table).values(
-                    player_id=p["player_id"],
-                    canonical_name=p["canonical_name"],
-                    first_seen_season=p["first_seen_season"],
-                    last_seen_season=p["last_seen_season"],
-                ).on_conflict_do_update(
-                    index_elements=["player_id"],
-                    set_={
-                        "first_seen_season": p["first_seen_season"],
-                        "last_seen_season": p["last_seen_season"],
-                    },
-                )
-            )
-        for pid, aliases in ((pid, registry.get_aliases(pid)) for pid in (p["player_id"] for p in registry.all_players())):
-            for alias in aliases:
-                conn.execute(
-                    pg_insert(player_names_table).values(
-                        player_id=pid,
-                        name=alias["name"],
-                        season=alias["season"],
-                        team=alias["team"],
-                    ).on_conflict_do_update(
-                        index_elements=["name", "season"],
-                        set_={"player_id": pid, "team": alias["team"]},
-                    )
-                )
+def load_registry(
+    engine: Engine,
+    registry: PlayerRegistry,
+) -> None:
+    """
+    Write the in-memory player registry to PostgreSQL.
 
+    Uses batched upserts so large historical registries do not
+    require thousands of individual database round trips.
+    """
+
+    players = list(
+        registry.all_players()
+    )
+
+    if not players:
+        return
+
+    # ------------------------------------------------------
+    # Player rows
+    # ------------------------------------------------------
+
+    player_rows = [
+        {
+            "player_id": p["player_id"],
+            "canonical_name": p["canonical_name"],
+            "first_seen_season": p["first_seen_season"],
+            "last_seen_season": p["last_seen_season"],
+        }
+        for p in players
+    ]
+
+    player_insert = pg_insert(
+        players_table
+    )
+
+    player_upsert = (
+        player_insert
+        .on_conflict_do_update(
+            index_elements=[
+                "player_id"
+            ],
+            set_={
+                "first_seen_season":
+                    player_insert.excluded.first_seen_season,
+                "last_seen_season":
+                    player_insert.excluded.last_seen_season,
+            },
+        )
+    )
+
+    # ------------------------------------------------------
+    # Alias rows
+    #
+    # Deduplicate on the same key used by the PostgreSQL
+    # conflict target. This avoids PostgreSQL complaining if
+    # the in-memory registry contains the same name/season
+    # combination more than once.
+    # ------------------------------------------------------
+
+    aliases_by_key = {}
+
+    for p in players:
+        player_id = p[
+            "player_id"
+        ]
+
+        for alias in registry.get_aliases(
+            player_id
+        ):
+            key = (
+                alias["name"],
+                alias["season"],
+            )
+
+            aliases_by_key[
+                key
+            ] = {
+                "player_id": player_id,
+                "name": alias["name"],
+                "season": alias["season"],
+                "team": alias["team"],
+            }
+
+    alias_rows = list(
+        aliases_by_key.values()
+    )
+
+    alias_insert = pg_insert(
+        player_names_table
+    )
+
+    alias_upsert = (
+        alias_insert
+        .on_conflict_do_update(
+            index_elements=[
+                "name",
+                "season",
+            ],
+            set_={
+                "player_id":
+                    alias_insert.excluded.player_id,
+                "team":
+                    alias_insert.excluded.team,
+            },
+        )
+    )
+
+    # ------------------------------------------------------
+    # Execute in batches
+    # ------------------------------------------------------
+
+    with engine.begin() as conn:
+        conn.execute(
+            player_upsert,
+            player_rows,
+        )
+
+        if alias_rows:
+            conn.execute(
+                alias_upsert,
+                alias_rows,
+            )
 
 def load_season(
     engine: Engine,
@@ -584,14 +677,34 @@ def load_season(
             d["game_type"] = game.game_type
             all_defensive.append(d)
 
-    # Determine season from the games being loaded
-    season = games[0].season if games else None
+        # Determine season from the games being loaded
+        season = games[0].season if games else None
 
-    # Build games table rows
-    all_games = [
-        {"game_id": game.id, "season": game.season, "league": game.league, "game_type": game.game_type}
-        for game in games
-    ]
+        # Build games table rows
+        all_games = [
+            {
+                "game_id": game.id,
+                "season": game.season,
+                "league": game.league,
+                "game_type": game.game_type,
+            }
+            for game in games
+        ]
+
+    # ------------------------------------------------------
+    # Persist any players discovered while building plays
+    # and game-stat rows.
+    #
+    # _build_play_dicts() and the player-stat builders can
+    # register previously unseen players. Those IDs must exist
+    # in the players table before rows referencing them are
+    # inserted into plays / player_game_* tables.
+    # ------------------------------------------------------
+
+        load_registry(
+            engine,
+            registry,
+        )
 
     with engine.begin() as conn:
         # Clear existing data for this season to avoid duplicates on re-runs
@@ -664,6 +777,40 @@ def _compute_half_seconds(play) -> int | None:
         return clock_secs + 900
     return clock_secs
 
+def _compute_game_seconds(play) -> int | None:
+    """Seconds remaining in regulation.
+
+    Q1 15:00 -> 3600
+    Q2 15:00 -> 2700
+    Q3 15:00 -> 1800
+    Q4 15:00 -> 900
+    End regulation -> 0
+
+    Overtime uses 0 here and is distinguished by is_overtime.
+    """
+    if play.quarter is None or not play.clock:
+        return None
+
+    try:
+        minutes, seconds = play.clock.split(":")
+        clock_seconds = int(minutes) * 60 + int(seconds)
+    except (ValueError, AttributeError):
+        return None
+
+    if play.quarter == 1:
+        return 2700 + clock_seconds
+    if play.quarter == 2:
+        return 1800 + clock_seconds
+    if play.quarter == 3:
+        return 900 + clock_seconds
+    if play.quarter == 4:
+        return clock_seconds
+
+    # Overtime
+    if play.quarter >= 5:
+        return 0
+
+    return None
 
 def _build_play_dicts(game: Game, registry: PlayerRegistry) -> list[dict]:
     """Build list of play insert dicts for a game."""
@@ -686,6 +833,7 @@ def _build_play_dicts(game: Game, registry: PlayerRegistry) -> list[dict]:
             "play_type": play.play_type.value,
             "description": play.description,
             "css": play.css,
+            "counts_as_play": play.counts_as_play,
             "down": play.down,
             "distance": play.distance,
             "distance_text": play.distance_text,
@@ -733,6 +881,7 @@ def _build_play_dicts(game: Game, registry: PlayerRegistry) -> list[dict]:
             "pat_good": play.pat_good,
             "yardline_100": _compute_yardline_100(play, team_abbr),
             "half_seconds": _compute_half_seconds(play),
+            "game_seconds": _compute_game_seconds(play),
         })
     return rows
 

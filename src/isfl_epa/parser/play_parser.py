@@ -129,7 +129,7 @@ _INTERCEPTION_RE = re.compile(
 _TIMEOUT_APPENDED_RE = re.compile(r"Timeout called by (\w+)")
 _TURNOVER_ON_DOWNS_RE = re.compile(r"Turnover on downs")
 _AUTO_FIRST_DOWN_RE = re.compile(r"Automatic First Down")
-_SAFETY_RE = re.compile(r"Safety")
+_SAFETY_RE = re.compile(r"The play results in a SAFETY!", re.IGNORECASE)
 _TACKLE_RE = re.compile(r"Tackle by ([^<]+)\.(?=\.|<|\s|$)")
 _PUNT_RETURN_RE = re.compile(r"Returned by (.+?) for (\d+) yards")
 
@@ -430,15 +430,82 @@ def parse_game(raw_game: dict, season: int, league: str) -> Game:
     unparsed: list[dict] = []
 
     for q_key, q_num in _QUARTER_KEYS:
-        for raw_play in raw_game.get(q_key, []):
+        raw_plays = raw_game.get(q_key, [])
+        quarter_plays: list[ParsedPlay] = []
+
+        for raw_play in raw_plays:
             play = parse_play(raw_play, q_num, game_id)
-            plays.append(play)
+            quarter_plays.append(play)
+
             if play.play_type == PlayType.UNKNOWN:
                 unparsed.append({
                     "quarter": q_num,
                     "clock": play.clock,
                     "description": play.description,
                 })
+
+        # Identify penalty -> "---" companion rows.
+        for i in range(1, len(quarter_plays)):
+            play = quarter_plays[i]
+            prev = quarter_plays[i - 1]
+
+            raw_play = raw_plays[i]
+
+            t_field = str(raw_play.get("t", "")).strip()
+
+            if t_field != "---":
+                continue
+
+            if prev.play_type != PlayType.PENALTY:
+                continue
+
+            next_play = (
+                            quarter_plays[i + 1]
+                            if i + 1 < len(quarter_plays)
+                            else None
+                        )
+ 
+            # "Play nullified" rows are followed by a genuinely new play.
+            if "Play nullified" in prev.description:
+                continue
+
+            
+
+            # Scoring result clearly counted.
+            if play.touchdown:
+                continue
+
+            if (
+                play.play_type == PlayType.FIELD_GOAL
+                and play.fg_good is True
+            ):
+                continue
+
+            # Turnover-looking row where possession does NOT actually change:
+            # the turnover was part of the penalized/non-counting action.
+            if (
+                next_play is not None
+                and (play.interception or play.fumble_lost)
+                and next_play.possession_team_id == play.possession_team_id
+            ):
+                play.counts_as_play = False
+                continue
+
+            # Incomplete pass after a penalty that created a new first down.
+            # If the following play is still 1st down at exactly the same
+            # field position, the incomplete pass did not count.
+            if (
+                next_play is not None
+                and play.play_type == PlayType.PASS
+                and play.yards_gained == 0
+                and next_play.down == 1
+                and next_play.yard_line == play.yard_line
+                and next_play.yard_line_team == play.yard_line_team
+            ):
+                play.counts_as_play = False
+                continue
+
+        plays.extend(quarter_plays)
 
     # Derive home/away from first play with score data
     home_team = away_team = None
@@ -512,6 +579,112 @@ def parse_game(raw_game: dict, season: int, league: str) -> Game:
             # Fallback: sorted IDs (old behavior)
             id_list = sorted(team_ids)
             away_team_id, home_team_id = id_list[0], id_list[1]
+            # Repair missing down/distance on counting scrimmage plays that follow
+    # a penalty and use the raw "---" state marker.
+    repaired_penalty_states = 0
+
+    def _offense_abbr(play: ParsedPlay) -> str | None:
+        if play.possession_team_id == home_team_id:
+            return home_team
+        if play.possession_team_id == away_team_id:
+            return away_team
+        return None
+
+    def _yards_from_own_goal(play: ParsedPlay, offense: str) -> int | None:
+        if play.yard_line is None or play.yard_line_team is None:
+            return None
+
+        if play.yard_line_team == offense:
+            return play.yard_line
+
+        return 100 - play.yard_line
+
+    for i in range(1, len(plays)):
+        play = plays[i]
+
+        if not play.counts_as_play:
+            continue
+
+        if play.play_type not in (
+            PlayType.PASS,
+            PlayType.RUSH,
+            PlayType.SACK,
+        ):
+            continue
+
+        if play.down is not None and play.distance is not None:
+            continue
+
+        if "2 point conversion" in play.description.lower():
+            continue
+
+        if plays[i - 1].play_type != PlayType.PENALTY:
+            continue
+
+        j = i - 1
+
+        while (
+            j >= 0
+            and plays[j].play_type == PlayType.PENALTY
+            and (plays[j].down is None or plays[j].distance is None)
+        ):
+            j -= 1
+
+        if j < 0:
+            continue
+
+        base_penalty = plays[j]
+
+        if base_penalty.play_type != PlayType.PENALTY:
+            continue
+
+        if base_penalty.quarter != play.quarter:
+            continue
+
+        if base_penalty.down is None or base_penalty.distance is None:
+            continue
+
+        offense = _offense_abbr(play)
+        prev_offense = _offense_abbr(base_penalty)
+
+        if offense is None or prev_offense != offense:
+            continue
+
+        prev_pos = _yards_from_own_goal(base_penalty, offense)
+        current_pos = _yards_from_own_goal(play, offense)
+
+        if prev_pos is None or current_pos is None:
+            continue
+
+        penalty_gain = current_pos - prev_pos
+
+        if penalty_gain >= base_penalty.distance:
+            play.down = 1
+
+            yards_to_goal = max(1, 100 - current_pos)
+
+            if yards_to_goal <= 10:
+                play.distance = yards_to_goal
+                play.distance_text = "Goal"
+            else:
+                play.distance = 10
+                play.distance_text = "10"
+        else:
+            play.down = base_penalty.down
+            play.distance = max(
+                1,
+                base_penalty.distance - penalty_gain,
+            )
+            play.distance_text = str(play.distance)
+
+        repaired_penalty_states += 1
+        
+    if repaired_penalty_states:
+        logger.debug(
+            "Game %d: repaired %d penalty-following play states",
+            game_id,
+            repaired_penalty_states,
+        )
 
     total = len(plays)
     parsed_count = total - len(unparsed)

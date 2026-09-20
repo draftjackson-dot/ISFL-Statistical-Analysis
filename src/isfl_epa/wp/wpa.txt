@@ -1,0 +1,37 @@
+import numpy as np
+import pandas as pd
+
+
+WP_FEATURE_COLS = [
+    "down",
+    "distance",
+    "yardline_100",
+    "score_differential",
+    "game_seconds",
+    "is_home",
+    "is_overtime",
+]
+
+
+def valid_wp_state_mask(df: pd.DataFrame) -> pd.Series:
+    """Rows that contain enough pre-play state to estimate win probability."""
+    return (
+        df["counts_as_play"].fillna(True)
+        & df["possession_team_id"].notna()
+        & df["score_home"].notna()
+        & df["score_away"].notna()
+        & df["game_seconds"].notna()
+        & df["yardline_100"].notna()
+        & df["down"].notna()
+        & df["distance"].notna()
+    )
+
+
+def add_wp_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # Assume existing feature-building code already creates is_home and
+    # score_differential. If not, we'll reuse the EPA implementation.
+    df["is_overtime"] = (df["quarter"] >= 5).astype(int)
+
+    return df
